@@ -1,93 +1,145 @@
-## Kavel — generate an AI image from Nim.
-##
-## Kavel is a free AI video generator and AI image generator at https://www.kavel.ai.
-## Without an API key a call runs on Kavel's free allowance (text to image).
-## With a key (``apiKey`` or the ``KAVEL_API_KEY`` environment variable) it runs on
-## your Kavel account: your credits and the image models your plan includes.
+## Generate and edit AI images from Nim with no API key and no account.
 ##
 ## .. code-block:: nim
 ##   import kavel
-##   echo generate("a paper-cut fox in a moonlit forest")
+##   let r = generate("matte black ceramic mug on pale oak, soft window light")
+##   if r.ok: echo r.image.url else: echo r.reason, ": ", r.message
 ##
-## Compile with ``-d:ssl``.
+## Without a key this calls the anonymous tier of https://www.kavel.ai, which
+## meters a small free allowance against a client id this module invents
+## rather than an account you register. Pass `apiKey` (or set KAVEL_API_KEY)
+## to run on your account.
+##
+## Compile with `-d:ssl`.
 
 import std/[httpclient, json, os, random, strutils, times, uri]
 
-const
-  BaseUrl* = "https://www.kavel.ai"
-  KeysUrl* = BaseUrl & "/settings/apikeys"
-  FreeModel = "kavel-image-v1"
-  UserAgent = "kavel-nim/0.1.0"
+type
+  Reason* = enum
+    rNone = "none"
+    rQuota = "quota"        ## free allowance spent; wait, or pass a key
+    rRejected = "rejected"  ## prompt refused; reword it
+    rSignIn = "sign_in"     ## needs an account
+    rAuth = "auth"          ## invalid API key
+    rTimeout = "timeout"    ## no image before the deadline
+    rOther = "other"
 
-type KavelError* = object of CatchableError
-  ## Raised with a readable reason: spent allowance, refused prompt, bad key, timeout.
+  Image* = object
+    url*: string          ## permanent, cacheable CDN link
+    watermarked*: bool    ## whether a mark was actually drawn
+
+  Result* = object
+    ok*: bool
+    image*: Image
+    reason*: Reason
+    message*: string
+
+  Options* = object
+    aspectRatio*: string  ## "1:1", "16:9", "9:16", "4:3" or "3:4"
+    apiKey*: string       ## key from https://www.kavel.ai/settings/apikeys
+    model*: string        ## engine override, honoured only with a key
+    pollSeconds*: int
+    timeoutSeconds*: int
+
+var baseUrl* = "https://www.kavel.ai"
+
+proc defaultOptions*(): Options =
+  Options(aspectRatio: "1:1", pollSeconds: 5, timeoutSeconds: 360)
+
+proc fail(r: Reason, msg: string): Result =
+  Result(ok: false, reason: r, message: "kavel: " & msg)
 
 proc anonId(): string =
   randomize()
   result = "nim-"
-  for _ in 0 ..< 16: result.add "0123456789abcdef"[rand(15)]
+  for _ in 1..8: result.add toHex(rand(255), 2).toLowerAscii
 
-proc call(c: HttpClient, meth: HttpMethod, url: string, body: JsonNode): JsonNode =
-  let resp = c.request(url, httpMethod = meth,
-                       body = (if body.isNil: "" else: $body))
+proc keyOf(o: Options): string =
+  if o.apiKey.len > 0: o.apiKey else: getEnv("KAVEL_API_KEY")
+
+# Refusals answer HTTP 200 with code -1 and a human message.
+proc request(c: HttpClient, meth: HttpMethod, url: string, body = ""): (bool, JsonNode, Result) =
+  var resp: Response
   try:
-    result = parseJson(resp.body)
-  except JsonParsingError:
-    result = %*{"code": -1, "message": "HTTP " & resp.status}
+    resp = c.request(url, httpMethod = meth, body = body)
+  except CatchableError as e:
+    return (false, nil, fail(rOther, e.msg))
+  var env: JsonNode
+  try:
+    env = parseJson(resp.body)
+  except CatchableError:
+    return (false, nil, fail(rOther, "unexpected response"))
+  if env{"code"}.getInt(-1) != 0:
+    let msg = env{"message"}.getStr("request refused")
+    let low = msg.toLowerAscii
+    let r =
+      if "invalid api key" in low: rAuth
+      elif "insufficient credits" in low: rQuota
+      elif "sign in" in low or "subscription" in low: rSignIn
+      else: rOther
+    return (false, nil, fail(r, msg))
+  (true, (if env.hasKey("data"): env["data"] else: newJObject()), Result())
 
-proc generate*(prompt: string, apiKey = "", model = "", aspectRatio = "1:1",
-               timeoutSec = 360, pollEverySec = 5): string =
-  ## Generates one image and returns its URL.
-  let text = prompt.strip
-  if text.len == 0: raise newException(KavelError, "write a prompt first")
-  let key = if apiKey.len > 0: apiKey else: getEnv("KAVEL_API_KEY")
-  var headers = newHttpHeaders({"Content-Type": "application/json", "User-Agent": UserAgent})
-  if key.len > 0: headers["Authorization"] = "Bearer " & key
-  else: headers["x-anon-id"] = anonId()
-  let c = newHttpClient(headers = headers, timeout = 60_000)
+proc run(payload: JsonNode, o: Options): Result =
+  let key = keyOf(o)
+  let c = newHttpClient(timeout = 60_000)
   defer: c.close()
+  c.headers = newHttpHeaders({"Content-Type": "application/json"})
+  if key.len > 0: c.headers["Authorization"] = "Bearer " & key
+  else: c.headers["x-anon-id"] = anonId()
+  let deadline = epochTime() + float(if o.timeoutSeconds > 0: o.timeoutSeconds else: 360)
 
-  let submit = c.call(HttpPost, BaseUrl & "/api/ai/generate", %*{
-    "provider": "kie", "mediaType": "image",
-    "model": (if key.len > 0 and model.len > 0: model else: FreeModel),
-    "scene": "text-to-image", "prompt": text,
-    "options": {"aspect_ratio": aspectRatio}})
-  if submit{"code"}.getInt(-1) != 0:
-    raise newException(KavelError, submit{"message"}.getStr("request refused"))
-  let data = submit{"data"}
-  if data{"wall"}.getBool(false):
-    raise newException(KavelError, "the free allowance is spent - pass an API key from " & KeysUrl)
-  let task = data{"id"}.getStr
-  if task.len == 0: raise newException(KavelError, "Kavel returned no task id")
+  let (ok, d, err) = request(c, HttpPost, baseUrl & "/api/ai/generate", $payload)
+  if not ok: return err
+  # The quota wall answers 200 with code 0 and wall: true.
+  if d{"wall"}.getBool(false):
+    case d{"reason"}.getStr("")
+    of "anon_ip_daily": return fail(rQuota, "this machine has used its free credits for today")
+    of "anon_unmetered_video": return fail(rSignIn, "this needs a signed-in account")
+    else: return fail(rQuota, "the free allowance does not cover this run")
+  let task = d{"id"}.getStr("")
+  if task.len == 0: return fail(rOther, "the service returned no task id")
 
-  let deadline = epochTime() + timeoutSec.float
   while epochTime() < deadline:
-    sleep(pollEverySec * 1000)
-    var env: JsonNode
-    try:
-      env = if key.len > 0:
-        c.call(HttpPost, BaseUrl & "/api/ai/query", %*{"taskId": task})
-      else:
-        c.call(HttpGet, BaseUrl & "/api/ai/anon-query?" & encodeQuery(
-          {"taskId": task, "provider": "kie", "mediaType": "image"}), nil)
-    except CatchableError:
-      continue # a dropped poll is not a failed generation
-    if env{"code"}.getInt(-1) != 0: continue
-    let d = env{"data"}
-    if d{"status"}.getStr == "failed":
-      raise newException(KavelError, "generation failed - try another prompt")
-    for field in ["cleanImages", "images"]:
-      let imgs = d{field}
-      if not imgs.isNil and imgs.kind == JArray and imgs.len > 0:
-        let first = imgs[0]
-        return (if first.kind == JObject: first{"url"}.getStr else: first.getStr)
-  raise newException(KavelError, "still running after " & $timeoutSec & " seconds (task " & task & ")")
+    sleep(1000 * (if o.pollSeconds > 0: o.pollSeconds else: 5))
+    let (pok, p, _) =
+      if key.len > 0: request(c, HttpPost, baseUrl & "/api/ai/query", $(%*{"taskId": task}))
+      else: request(c, HttpGet, baseUrl & "/api/ai/anon-query?taskId=" & encodeUrl(task) & "&provider=kie&mediaType=image")
+    # Free runs only start when a poll crosses the end of the queue, so a
+    # dropped poll is not a failed job: keep going.
+    if not pok: continue
+    if p{"cleanImages"}.len > 0:
+      return Result(ok: true, image: Image(url: p["cleanImages"][0].getStr, watermarked: false))
+    if p{"images"}.len > 0:
+      let wm = p{"watermarked"}.len > 0 and p["watermarked"][0].getBool(false)
+      return Result(ok: true, image: Image(url: p["images"][0].getStr, watermarked: wm))
+    if p{"status"}.getStr("") in ["failed", "error"]:
+      return fail(rRejected, "prompt refused; reword it")
+  fail(rTimeout, "no image before the deadline")
 
-when isMainModule:
-  let prompt = commandLineParams().join(" ")
-  if prompt.len == 0:
-    quit("usage: kavel <prompt>", 2)
-  try:
-    echo generate(prompt)
-  except KavelError as e:
-    quit("kavel: " & e.msg, 1)
+proc generate*(prompt: string, o = defaultOptions()): Result =
+  ## Turns a prompt into a new image. Naming the light, the material and the
+  ## composition moves the result far more than adding adjectives.
+  if prompt.strip.len == 0: return fail(rOther, "prompt is required")
+  let model = if keyOf(o).len > 0 and o.model.len > 0: o.model else: "kavel-image-v1"
+  run(%*{"provider": "kie", "mediaType": "image", "model": model, "scene": "text-to-image",
+         "prompt": prompt, "options": {"aspect_ratio": (if o.aspectRatio.len > 0: o.aspectRatio else: "1:1")}}, o)
+
+proc edit*(sourceUrl, instruction: string, o = defaultOptions()): Result =
+  ## Rewrites the image at a public url. An edit costs more than the free
+  ## allowance, so without a key this returns `rQuota` before anything is charged.
+  if not (sourceUrl.startsWith("http://") or sourceUrl.startsWith("https://")):
+    return fail(rOther, "sourceUrl must be a public http(s) url")
+  if instruction.strip.len == 0: return fail(rOther, "instruction is required")
+  let model = if keyOf(o).len > 0 and o.model.len > 0: o.model else: "nano-banana-2-lite"
+  run(%*{"provider": "kie", "mediaType": "image", "model": model, "scene": "image-to-image",
+         "prompt": instruction, "options": {"image_input": [sourceUrl]}}, o)
+
+proc credits*(): tuple[ok: bool, remaining, grant: int, message: string] =
+  ## What a fresh anonymous client id is granted. Free to call.
+  let c = newHttpClient(timeout = 30_000)
+  defer: c.close()
+  c.headers = newHttpHeaders({"x-anon-id": anonId()})
+  let (ok, d, err) = request(c, HttpGet, baseUrl & "/api/ai/anon-credits")
+  if not ok: return (false, 0, 0, err.message)
+  (true, d{"remaining"}.getInt, d{"grant"}.getInt, "")
